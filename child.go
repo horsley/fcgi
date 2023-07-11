@@ -23,6 +23,7 @@ import (
 // it's converted to an http.Request.
 type request struct {
 	pw        *io.PipeWriter
+	role      uint16
 	reqId     uint16
 	params    map[string]string
 	buf       [1024]byte
@@ -209,11 +210,12 @@ func (c *child) handleRecord(rec *record) error {
 		if err := br.read(rec.content()); err != nil {
 			return err
 		}
-		if br.role != roleResponder {
+		if br.role != roleResponder && br.role != roleAuthorizer {
 			c.conn.writeEndRequest(rec.h.Id, 0, statusUnknownRole)
 			return nil
 		}
 		req = newRequest(rec.h.Id, br.flags)
+		req.role = br.role
 		c.requests[rec.h.Id] = req
 		return nil
 	case typeParams:
@@ -224,7 +226,11 @@ func (c *child) handleRecord(rec *record) error {
 			return nil
 		}
 		req.parseParams()
-		return nil
+
+		if req.role == roleResponder {
+			return nil
+		}
+		fallthrough //authorizer start serveRequest when params ready, there is no stdin record
 	case typeStdin:
 		content := rec.content()
 		if req.pw == nil {
@@ -289,6 +295,15 @@ func filterOutUsedEnvVars(envVars map[string]string) map[string]string {
 
 func (c *child) serveRequest(req *request, body io.ReadCloser) {
 	r := newResponse(c, req)
+
+	// According to RFC 3875, SERVER_PROTOCOL value might be "INCLUDED", which break the next invocation of net/http/cgi.RequestFromMap
+	// golang cgi library using http.ParseHTTPVersion expect SERVER_PROTOCOL with value like "HTTP X.Y"
+	// RFC claims that we should treat this as an HTTP/1.0 request
+	// See: https://datatracker.ietf.org/doc/html/rfc3875#section-4.1.16
+	if req.params["SERVER_PROTOCOL"] == "INCLUDED" {
+		req.params["SERVER_PROTOCOL"] = "HTTP/1.0"
+	}
+
 	httpReq, err := cgi.RequestFromMap(req.params)
 	if err != nil {
 		// there was an error reading the request
